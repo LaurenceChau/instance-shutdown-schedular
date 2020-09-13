@@ -18,6 +18,7 @@ simple_logger = "^1.9"
 simple-error = "^0.2"
 chrono = "^0.4"
 futures = "^0.3"
+tokio = "0.2"
 
 [[bin]]
 name = "bootstrap"

@@ -777,6 +777,7 @@ dependencies = [
  "serde_json",
  "simple-error",
  "simple_logger",
+ "tokio 0.2.22",
 ]
 
 [[package]]

@@ -6,25 +6,27 @@ extern crate simple_error;
 extern crate rusoto_ec2;
 extern crate chrono;
 extern crate futures;
+extern crate tokio;
 
-use std::error::Error;
 use lambda::{error::HandlerError, Context, lambda};
-use log::{LevelFilter, error};
+use log::{LevelFilter};
 use serde::{Deserialize, Serialize};
 use simple_logger::SimpleLogger;
 use simple_error::bail;
+
 use rusoto_core::{
     Region, HttpClient,credential::ChainProvider, credential::ProfileProvider, RusotoError
 };
-use rusoto_ec2::Ec2Client;
 use rusoto_ec2::{
-    DescribeInstancesRequest, StopInstancesRequest, StartInstancesRequest, 
+    Ec2Client, DescribeInstancesRequest, StopInstancesRequest, StartInstancesRequest, 
     Ec2, Filter, filter, StartInstancesResult, StopInstancesResult, StartInstancesError,
     StopInstancesError
 };
 use std::path::Path;
 use chrono::prelude::*;
 use futures::{future, Future};
+
+type Error = Box<dyn std::error::Error + Send + Sync + 'static>;
 
 #[derive(Debug, PartialEq)]
 struct VMInstance {
@@ -71,23 +73,24 @@ fn ec2_client() -> Ec2Client {
     )
 }
 
-fn get_instances(client: &Ec2Client, filters: Vec<Filter>) -> Vec<VMInstance>{
+async fn get_instances(client: &Ec2Client, filters: Vec<Filter>) -> Vec<VMInstance>{
 
     let des_instance_req = DescribeInstancesRequest {
         filters: Some(filters),
         ..DescribeInstancesRequest::default()
     };
 
-    let result;
-    async {
-        result = client.describe_instances(des_instance_req).await.unwrap_or_default();
-    };
+    let result; //= client.describe_instances(des_instance_req).await.unwrap();
+
+   
+    result = client.describe_instances(des_instance_req).await.unwrap();
+
 
     result.reservations.unwrap().iter().flat_map(|r| {
-        r.instances.unwrap().iter().map(|i| {
-            let schedule_tag = i.tags.unwrap().iter().filter(|tag| {tag.key == Some("schedule_workhours".to_string())}).next();
-            let overtime_tag = i.tags.unwrap().iter().filter(|tag| {tag.key == Some("schedule_extra_workhours".to_string())}).next();
-            let instance_id = i.instance_id;
+        r.instances.as_ref().unwrap().iter().map(|i| {
+            let schedule_tag = i.tags.as_ref().unwrap().into_iter().filter(|tag| {tag.key == Some("schedule_workhours".to_string())}).next();
+            let overtime_tag = i.tags.as_ref().unwrap().iter().filter(|tag| {tag.key == Some("schedule_extra_workhours".to_string())}).next();
+            let instance_id = i.instance_id.clone();
             (instance_id, schedule_tag, overtime_tag)
         })
         .map(|instance_info| {
@@ -98,23 +101,23 @@ fn get_instances(client: &Ec2Client, filters: Vec<Filter>) -> Vec<VMInstance>{
                 workSchedule: WorkTime {
                     start: {
                         NaiveTime::parse_from_str(
-                            instance_info.1.unwrap().value.unwrap().split("|").collect::<Vec<&str>>()[0].split("-").collect::<Vec<&str>>()[0], 
+                            instance_info.1.unwrap().value.as_ref().unwrap().split("|").collect::<Vec<&str>>()[0].split("-").collect::<Vec<&str>>()[0], 
                             "%H%M"
                         ).ok()
                     },
                     end: {
                         NaiveTime::parse_from_str(
-                            instance_info.1.unwrap().value.unwrap().split("|").collect::<Vec<&str>>()[0].split("-").collect::<Vec<&str>>()[0], 
+                            instance_info.1.unwrap().value.as_ref().unwrap().split("|").collect::<Vec<&str>>()[0].split("-").collect::<Vec<&str>>()[0], 
                             "%H%M"
                         ).ok()
                     },
                     weekdays: {
-                        instance_info.1.unwrap().value.unwrap().split("|")
+                        instance_info.1.unwrap().value.as_ref().unwrap().split("|")
                             .collect::<Vec<&str>>()[1].split(",").map(|wday| wday.parse().ok()).collect::<Option<Vec<u32>>>()
                     }
                 },
                 overtimeSchedule: {
-                    instance_info.2.unwrap().value.unwrap().split(",").map(|ot| {
+                    instance_info.2.unwrap().value.as_ref().unwrap().split(",").map(|ot| {
                         Overtime {
                             start: {
                                 NaiveTime::parse_from_str(
@@ -155,11 +158,10 @@ async fn stop_instances(client: &Ec2Client, instances:Vec<VMInstance>) -> Result
     client.stop_instances(stop_instances_req).await
 }
 
-fn main() -> Result<(), Box<dyn Error>> {
+#[tokio::main]
+async fn main() -> Result<(), Error> {
 
-    SimpleLogger::new()
-        .with_level(LevelFilter::Debug)
-        .init().unwrap();
+    SimpleLogger::new().with_level(LevelFilter::Debug).init().unwrap();
     lambda!(shutdown_sheduler);
 
     Ok(())
@@ -170,26 +172,27 @@ async fn shutdown_sheduler(e: CustomEvent, c: Context) -> Result<CustomOutput, H
     let ec2Client = ec2_client();
     let tag_key1 = filter!("tag:schedule_workhours");
     let tag_key2 = filter!("tag:schedule_extra_workhours");
-    let instances = get_instances(&ec2Client, vec![tag_key1, tag_key2]);
+    let instances = get_instances(&ec2Client, vec![tag_key1, tag_key2]).await;
+
+    // time
     let now_nt = Utc::now().naive_utc();
     let now_hhmm_nt = NaiveTime::from_hms(now_nt.time().hour(), now_nt.time().minute(), 0);
     let date_nt = now_nt.date();
     let weekday_nt = now_nt.weekday();
     
-    //instances to be startup
+    // instances to be startup
     let instances_to_startup = instances.into_iter().filter(|i| {
         i.overtimeSchedule.iter().any(|ot| ot.start.unwrap() == now_hhmm_nt && ot.date.unwrap() == date_nt) || 
         i.workSchedule.start.unwrap() == now_hhmm_nt && i.workSchedule.weekdays.unwrap().iter().any(|&d| d == weekday_nt.num_days_from_sunday())
     }).collect();
+    let start_instances_result = start_instances(&ec2Client, instances_to_startup).await;
 
-    //instances to be shutdown
+    // instances to be shutdown
     let instances_to_shutdown = instances.into_iter().filter(|i| {
         i.overtimeSchedule.iter().any(|ot| ot.end.unwrap() == now_hhmm_nt && ot.date.unwrap() == date_nt ) || 
         i.workSchedule.end.unwrap() == now_hhmm_nt && i.workSchedule.weekdays.unwrap().iter().any(|&d| d == weekday_nt.num_days_from_sunday())
     }).collect();
-
-    stop_instances(&ec2Client, instances_to_shutdown);
-    stop_instances(&ec2Client, instances_to_startup)
+    let stop_instances_result = stop_instances(&ec2Client, instances_to_startup)
 
     Ok(CustomOutput{
         message: format!("Hello, {}!", e.firstname), 
